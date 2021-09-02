@@ -32,7 +32,7 @@ class CMTLayers(nn.Module):
     def __init__(self, dim, num_heads=8, ffn_ratio = 4., 
                     relative_pos_embeeding=True, no_distance_pos_embeeding=False,
                     features_size=56, qkv_bias=False, qk_scale=None, 
-                    attn_drop=0., proj_drop=0., sr_ratio=1. , drop_path_rate=0.):
+                    attn_drop=0., proj_drop=0., sr_ratio=1. , drop_path_rate=0. , CSWin=False):
         super(CMTLayers, self).__init__()
 
         self.dim = dim 
@@ -40,19 +40,35 @@ class CMTLayers(nn.Module):
 
         self.norm1 = nn.LayerNorm(self.dim)
         self.norm2 = nn.LayerNorm(self.dim)
+        self.qkv = nn.Linear(self.dim,self.dim*3,qkv_bias)
         self.LPU = LocalPerceptionUint(self.dim)
-        self.LMHSA = LightMutilHeadSelfAttention(
-            dim = self.dim,
-            num_heads = num_heads,
-            relative_pos_embeeding = relative_pos_embeeding,
-            no_distance_pos_embeeding = no_distance_pos_embeeding,
-            features_size = features_size,
-            qkv_bias = qkv_bias,
-            qk_scale = qk_scale,
-            attn_drop= attn_drop,
-            proj_drop=proj_drop,
-            sr_ratio=sr_ratio
-        )
+        if CSWin:
+            self.attns = nn.ModuleList([
+                CSwinAttention(
+                    dim=self.dim//2,
+                    num_heads=num_heads,
+                    relative_pos_embeeding=relative_pos_embeeding,
+                    no_distance_pos_embeeding=no_distance_pos_embeeding,
+                    features_size=features_size,
+                    qkv_bias=qkv_bias,
+                    qk_scale=qk_scale,
+                    attn_drop=attn_drop,
+                    proj_drop=proj_drop,
+                    sr_ratio=sr_ratio,idx=i)
+                for i in range(2)])
+        else:
+            self.LMHSA = LightMutilHeadSelfAttention(
+                dim = self.dim,
+                num_heads = num_heads,
+                relative_pos_embeeding = relative_pos_embeeding,
+                no_distance_pos_embeeding = no_distance_pos_embeeding,
+                features_size = features_size,
+                qkv_bias = qkv_bias,
+                qk_scale = qk_scale,
+                attn_drop= attn_drop,
+                proj_drop=proj_drop,
+                sr_ratio=sr_ratio
+            )
         self.IRFFN = InvertedResidualFeedForward(self.dim, self.ffn_ratio)
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
 
@@ -64,8 +80,14 @@ class CMTLayers(nn.Module):
         x_1 = rearrange(x, 'b c h w -> b ( h w ) c ')
         norm1 = self.norm1(x_1)
         norm1 = rearrange(norm1, 'b ( h w ) c -> b c h w', h=h, w=w)
-        attn = self.LMHSA(norm1)
-        x = x + attn
+        if self.CSWin:
+            x1 = self.attns[0](norm1[:,:,:,c//2])
+            x2 = self.attns[0](norm1[:,:,:,c//2])
+            attened_x = torch.cat([x1,x2],dim=2)
+            x = x+self.drop_path(attened_x)
+        else:
+            attn = self.LMHSA(norm1)
+            x = x + attn
 
         b, c, h, w = x.shape
         x_2 = rearrange(x, 'b c h w -> b ( h w ) c ')
@@ -218,8 +240,142 @@ class LightMutilHeadSelfAttention(nn.Module):
         x = self.proj_drop(x)
             
         x = rearrange(x, 'B (H W) C -> B C H W ', H=H, W=W)
-        return x 
+        return x
 
+#By trans this def we could use CSWindows in CMT. --by Dylan
+class CSwinAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, features_size=56, 
+                relative_pos_embeeding=False, no_distance_pos_embeeding=False, qkv_bias=False, qk_scale=None, 
+                attn_drop=0., proj_drop=0., sr_ratio=1.,idx=-1):
+        super(CSwinAttention, self).__init__()
+        assert dim % num_heads == 0, f"dim {dim} should be divided by num_heads {num_heads}"
+        self.dim = dim 
+        self.num_heads = num_heads
+        head_dim = dim // num_heads   # used for each attention heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.relative_pos_embeeding = relative_pos_embeeding
+        self.no_distance_pos_embeeding = no_distance_pos_embeeding
+
+        self.features_size = features_size
+
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.kv = nn.Linear(dim, dim*2, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.softmax = nn.Softmax(dim=-1)
+
+        self.sr_ratio = sr_ratio
+        if sr_ratio > 1:
+            self.sr = nn.Conv2d(dim, dim, kernel_size=sr_ratio, stride=sr_ratio)
+            self.norm = nn.LayerNorm(dim) 
+        if idx == -1:
+            H_sp, W_sp = self.features_size,self.features_size
+        elif idx == 0:
+            H_sp, W_sp = self.features_size,self.sr_ratio
+        elif idx == 1:
+            H_sp, W_sp = self.sr_ratio,self.features_size
+        self.H_sp = H_sp
+        self.W_sp = W_sp
+        if self.relative_pos_embeeding:
+            self.relative_indices = generate_relative_distance(self.features_size)
+            self.position_embeeding = nn.Parameter(torch.randn(2 * self.features_size - 1, 2 * self.features_size - 1))
+        elif self.no_distance_pos_embeeding:
+            self.position_embeeding = nn.Parameter(torch.randn(self.features_size ** 2, self.features_size ** 2))
+        else:
+            self.position_embeeding = None
+
+        if self.position_embeeding is not None:
+            trunc_normal_(self.position_embeeding, std=0.2)
+
+    def im2cswin(self,x,func):
+        # B, N, C = x.shape
+        # H=W=int(np.sqrt(N))
+        # x=x.transpose(-2,-1).contiguous().view(B, C, H, W)
+        B, C, H, W = x.shape()
+        x = img2Windows(x,self.H_sp,self.W_sp)
+        x = func(x)
+        x = x.reshape(-1, self.H_sp* self.W_sp, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3).contiguous()
+        return x
+    # def get_lepe(self, x, func):
+    #     # B, N, C = x.shape
+    #     # H = W = int(np.sqrt(N))
+    #     # x = x.transpose(-2,-1).contiguous().view(B, C, H, W)
+        
+    #     H_sp, W_sp = self.H_sp, self.W_sp
+    #     x = x.view(B, C, H // H_sp, H_sp, W // W_sp, W_sp)
+    #     x = x.permute(0, 2, 4, 1, 3, 5).contiguous().reshape(-1, C, H_sp, W_sp) ### B', C, H', W'
+
+    #     lepe = func(x) ### B', C, H', W'
+    #     lepe = lepe.reshape(-1, self.num_heads, C // self.num_heads, H_sp * W_sp).permute(0, 1, 3, 2).contiguous()
+
+    #     x = x.reshape(-1, self.num_heads, C // self.num_heads, self.H_sp* self.W_sp).permute(0, 1, 3, 2).contiguous()
+    #     return x, lepe
+    def forward(self, x):
+        B, C, H, W = x.shape 
+        N = H*W
+        # x_q = rearrange(x, 'B C H W -> B (H W) C')  # translate the B,C,H,W to B (H X W) C
+        # q = self.q(x_q).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)   # B,N,H,DIM -> B,H,N,DIM
+        # x_q = self.img2cswin(x)
+        q = self.im2cswin(x,self.q)
+        # conv for down sample the x resoution for the k, v
+        if self.sr_ratio > 1:
+            x_reduce_resolution = self.sr(x)
+            # x_kv = rearrange(x_reduce_resolution, 'B C H W -> B (H W) C ')
+            # x_kv = self.norm(x_kv)
+            x_kv = self.im2cswin(x_reduce_resolution,self.norm)
+        else:
+            #x_kv = rearrange(x, 'B C H W -> B (H W) C ')
+            x_kv = self.im2cswin(x,self.norm)
+        
+        kv_emb = rearrange(self.kv(x_kv), 'B N (dim h l ) -> l B h N dim', h=self.num_heads, l=2)         # 2 B H N DIM
+        k, v = kv_emb[0], kv_emb[1]
+        
+        attn = (q @ k.transpose(-2, -1)) * self.scale    # (B H Nq DIM) @ (B H DIM Nk) -> (B H NQ NK)
+        
+        # TODO: add the relation position bias, because the k_n != q_n, we need to split the position embeeding matrix
+        q_n, k_n = q.shape[1], k.shape[2]
+       
+        if self.relative_pos_embeeding:
+            attn = attn + self.position_embeeding[self.relative_indices[:, :, 0], self.relative_indices[:, :, 1]][:, :k_n]
+        elif self.no_distance_pos_embeeding:
+            attn = attn + self.position_embeeding[:, :k_n]
+
+        attn = self.softmax(attn)
+        attn = self.attn_drop(attn)
+
+        #x = (attn @ v).transpose(1, 2).reshape(B, N, C)  # (B H NQ NK) @ (B H NK dim)  -> (B NQ H*DIM)
+        x = (attn @ v).transpose(1,2).rehsape(-1,self.H_sp*self.W_sp,C)
+        x = windows2img(x,self.H_sp,self.W_sp,H,W).view(B,-1,C)
+
+        x = self.proj(x)
+        x = self.proj_drop(x)
+            
+        x = rearrange(x, 'B (H W) C -> B C H W ', H=H, W=W)
+        return x
+
+#inspire from CSWinTransformer
+def img2Windows(img,H_sp,W_sp):
+    #Img:B C H W
+    B, C, H, W = img.shape()
+    img_reshape = img.view(B, C, H // H_sp, H_sp, W // W_sp, W_sp) ##这个地方按照sp的大小将图片的宽W和高H进行划分
+    img_perm = img_reshape.permute(0, 2, 4, 3, 5, 1).contiguous().reshape(-1, H_sp* W_sp, C)
+    #上面这个函数比较复杂，我们一点点看，首先img_reshape相当于重新shape的图片，可以看下img.view的用法https://blog.csdn.net/qq_26400705/article/details/109816853
+    #接下来我们看permute的用法https://zhuanlan.zhihu.com/p/76583143 相当于把img_reshape的维度顺序重新编码了
+    #原本，img_reshape内的顺序是：(B, C, H // H_sp, H_sp, W // W_sp, W_sp) 现在是(B,H//H_sp,W//W_sp,H_sp,W_sp,C)
+    #之后紧接一个contiguous操作，用法见https://blog.csdn.net/Z199448Y/article/details/89384158，相当于从内存上对矩阵进行优化
+    #接下来进行reshape操作，可以看reshape的用法，https://blog.csdn.net/qq_29831163/article/details/90112000
+    #这里面的-1意思是自动计算维度大小，第一个维度变成了H_sp* W_sp，最后一个维度是C
+    #所以最终返回的维度是(B*H//H_sp*W//W_sp,H_sp*W_sp,C) 
+    return img_perm
+def windows2img(img_splits_hw,H_sp,W_sp,H,W):
+    #img_splits_hw:B` H W C
+    B = int(img_splits_hw.shape[0] / (H * W / H_sp / W_sp))
+
+    img = img_splits_hw.view(B, H // H_sp, W // W_sp, H_sp, W_sp, -1)
+    img = img.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    return img
 
 class InvertedResidualFeedForward(nn.Module):
     def __init__(self, dim, dim_ratio=4.):
